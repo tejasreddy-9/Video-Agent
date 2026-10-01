@@ -1,0 +1,3 @@
+livekit-agents[openai,tavus]~=1.8
+livekit-api~=1.2
+python-dotenv

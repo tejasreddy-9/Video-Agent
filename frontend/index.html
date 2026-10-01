@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Video Agent POC</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
+    --border: #e4e4df; --accent: #2f6fed; --accent-text: #ffffff;
+    --user-bubble: #2f6fed; --user-text: #ffffff; --agent-bubble: #efefeb;
+    --danger: #d64545; --stage: #111110; --stage-text: #b9b9b3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1d1d1b; --text: #ececea; --muted: #9a9a94;
+      --border: #2e2e2b; --accent: #5b8cff; --accent-text: #0e0e0d;
+      --user-bubble: #3a64c8; --user-text: #ffffff; --agent-bubble: #2a2a27;
+      --danger: #ef6b6b; --stage: #0b0b0a; --stage-text: #8d8d87;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; min-height: 100vh; padding: 24px 16px;
+  }
+  main { width: 100%; max-width: 1040px; display: flex; flex-direction: column; gap: 16px; }
+  header { display: flex; align-items: center; justify-content: space-between; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; background: var(--panel);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill[data-state="listening"] .dot { background: #2fb36d; }
+  .pill[data-state="thinking"] .dot { background: #e0a526; animation: pulse 1s infinite; }
+  .pill[data-state="speaking"] .dot { background: var(--accent); animation: pulse .6s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+  @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } }
+  .stage {
+    position: relative; background: var(--stage); color: var(--stage-text);
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center;
+  }
+  .stage video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #agent-placeholder { padding: 16px; text-align: center; }
+  #self {
+    position: absolute; right: 12px; bottom: 12px; width: 26%; aspect-ratio: 4 / 3;
+    border-radius: 8px; overflow: hidden; border: 1px solid rgba(255, 255, 255, .25);
+    background: #000; display: none;
+  }
+  #self.on { display: block; }
+  #self.camera video { transform: scaleX(-1); }
+  #self.screen video { object-fit: contain; }
+  #transcript {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; min-height: 240px; max-height: 60vh; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .empty { color: var(--muted); margin: auto; text-align: center; }
+  .msg { max-width: 85%; padding: 8px 12px; border-radius: 14px; white-space: pre-wrap; }
+  .msg.agent { background: var(--agent-bubble); align-self: flex-start; border-bottom-left-radius: 4px; }
+  .msg.user { background: var(--user-bubble); color: var(--user-text); align-self: flex-end; border-bottom-right-radius: 4px; }
+  .msg.interim { opacity: .6; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font: inherit; border-radius: 10px; padding: 10px 18px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); flex: 1; font-weight: 600; }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  #error { color: var(--danger); font-size: 13px; min-height: 1em; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Video Agent POC</h1>
+    <span class="pill" id="status" data-state="idle"><span class="dot"></span><span id="status-text">Disconnected</span></span>
+  </header>
+
+  <div class="layout">
+    <section class="stage" id="stage">
+      <p id="agent-placeholder">Press Start to meet the agent.</p>
+      <div id="self"></div>
+    </section>
+    <section id="transcript"><p class="empty" id="empty">The conversation will appear here.</p></section>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="start">Start conversation</button>
+    <button id="mute" disabled>Mute</button>
+    <button id="camera" disabled>Camera off</button>
+    <button id="screen" disabled>Share screen</button>
+    <button class="danger" id="stop" disabled>End</button>
+  </div>
+  <div id="error"></div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.22.3/dist/livekit-client.umd.min.js"></script>
+<script>
+  const { Room, RoomEvent, Track, VideoPresets, ScreenSharePresets } = LivekitClient;
+  const $ = (id) => document.getElementById(id);
+  const bubbles = new Map();
+  let room = null;
+
+  function setStatus(state, text) {
+    $("status").dataset.state = state;
+    $("status-text").textContent = text ?? state[0].toUpperCase() + state.slice(1);
+  }
+
+  function upsertBubble(segmentId, role, text, final) {
+    $("empty")?.remove();
+    let el = bubbles.get(segmentId);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = `msg ${role}`;
+      $("transcript").appendChild(el);
+      bubbles.set(segmentId, el);
+    }
+    el.textContent = text;
+    el.classList.toggle("interim", role === "user" && !final);
+    $("transcript").scrollTop = $("transcript").scrollHeight;
+  }
+
+  // Self view shows whatever the agent is currently looking at: the screen share if active, else the camera.
+  function refreshSelfView() {
+    const self = $("self");
+    self.querySelectorAll("video").forEach((el) => el.remove());
+    self.className = "";
+    if (!room) return;
+    const local = room.localParticipant;
+    const screen = local.getTrackPublication(Track.Source.ScreenShare)?.track;
+    const camera = local.getTrackPublication(Track.Source.Camera)?.track;
+    const track = screen ?? (local.isCameraEnabled ? camera : null);
+    if (track) {
+      self.appendChild(track.attach());
+      self.className = `on ${screen ? "screen" : "camera"}`;
+    }
+    $("camera").textContent = local.isCameraEnabled ? "Camera off" : "Camera on";
+    $("screen").textContent = local.isScreenShareEnabled ? "Stop sharing" : "Share screen";
+  }
+
+  async function start() {
+    $("error").textContent = "";
+    $("start").disabled = true;
+    setStatus("idle", "Connecting…");
+    try {
+      const res = await fetch("/token");
+      if (!res.ok) throw new Error(`Token request failed (${res.status})`);
+      const { url, token } = await res.json();
+
+      // The agent only samples a frame every few seconds, so send small, low-bitrate video
+      // and leave the bandwidth for audio.
+      room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        videoCaptureDefaults: { resolution: VideoPresets.h360.resolution },
+        publishDefaults: {
+          simulcast: false,
+          videoEncoding: VideoPresets.h360.encoding,
+          screenShareEncoding: ScreenSharePresets.h720fps5.encoding,
+        },
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind === Track.Kind.Audio) {
+          document.body.appendChild(track.attach());
+        } else {
+          // The only remote video is the avatar worker publishing on the agent's behalf.
+          $("agent-placeholder").hidden = true;
+          $("stage").prepend(track.attach());
+        }
+      });
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        track.detach().forEach((el) => el.remove());
+        if (track.kind === Track.Kind.Video) $("agent-placeholder").hidden = false;
+      });
+      room.on(RoomEvent.ParticipantConnected, () => setStatus("idle", "Agent joined"));
+      room.on(RoomEvent.ParticipantAttributesChanged, (changed) => {
+        if (changed["lk.agent.state"]) setStatus(changed["lk.agent.state"]);
+      });
+      room.on(RoomEvent.LocalTrackPublished, refreshSelfView);
+      room.on(RoomEvent.LocalTrackUnpublished, refreshSelfView);
+      room.on(RoomEvent.Disconnected, cleanup);
+
+      room.registerTextStreamHandler("lk.transcription", async (reader, participant) => {
+        const attrs = reader.info.attributes ?? {};
+        const segmentId = attrs["lk.segment_id"] ?? reader.info.id;
+        const role = participant.identity === room.localParticipant.identity ? "user" : "agent";
+        const final = attrs["lk.transcription_final"] === "true";
+        let text = "";
+        for await (const chunk of reader) {
+          text += chunk;
+          upsertBubble(segmentId, role, text, final);
+        }
+      });
+
+      await room.connect(url, token);
+      await room.localParticipant.setMicrophoneEnabled(true);
+      await room.startAudio();
+      $("agent-placeholder").textContent = "Waiting for the agent's video…";
+      setStatus("idle", "Waiting for agent…");
+      ["mute", "camera", "screen", "stop"].forEach((id) => ($(id).disabled = false));
+
+      // The call still works as voice-only if the camera is blocked or missing.
+      try {
+        await room.localParticipant.setCameraEnabled(true);
+      } catch (err) {
+        $("error").textContent = `Camera unavailable: ${err.message}`;
+      }
+      refreshSelfView();
+    } catch (err) {
+      $("error").textContent = err.message;
+      cleanup();
+    }
+  }
+
+  async function toggleMute() {
+    const enabled = room.localParticipant.isMicrophoneEnabled;
+    await room.localParticipant.setMicrophoneEnabled(!enabled);
+    $("mute").textContent = enabled ? "Unmute" : "Mute";
+  }
+
+  async function toggle(source) {
+    $("error").textContent = "";
+    const local = room.localParticipant;
+    try {
+      if (source === "camera") await local.setCameraEnabled(!local.isCameraEnabled);
+      else await local.setScreenShareEnabled(!local.isScreenShareEnabled);
+    } catch (err) {
+      if (err.name !== "NotAllowedError") $("error").textContent = err.message;
+    }
+    refreshSelfView();
+  }
+
+  function cleanup() {
+    room?.disconnect();
+    room = null;
+    document.querySelectorAll("audio, video").forEach((el) => el.remove());
+    $("self").className = "";
+    $("agent-placeholder").hidden = false;
+    $("agent-placeholder").textContent = "Press Start to meet the agent.";
+    $("start").disabled = false;
+    ["mute", "camera", "screen", "stop"].forEach((id) => ($(id).disabled = true));
+    $("mute").textContent = "Mute";
+    $("camera").textContent = "Camera off";
+    $("screen").textContent = "Share screen";
+    setStatus("idle", "Disconnected");
+  }
+
+  $("start").onclick = start;
+  $("mute").onclick = toggleMute;
+  $("camera").onclick = () => toggle("camera");
+  $("screen").onclick = () => toggle("screen");
+  $("stop").onclick = cleanup;
+</script>
+</body>
+</html>
